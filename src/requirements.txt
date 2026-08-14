@@ -1,0 +1,7 @@
+openai>=1.40.0
+pinecone>=5.0.0
+python-dotenv>=1.0.0
+flask>=3.0.0
+slack_sdk>=3.27.0
+mcp>=1.9.0
+gunicorn>=22.0.0
