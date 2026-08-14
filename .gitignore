@@ -25,3 +25,8 @@ screenshot.png
 
 # ngrok config, if you ever export one
 ngrok.yml
+
+# Knowledge base source docs — kept local only, not published.
+# Not needed at runtime: the deployed app queries the already-ingested
+# Pinecone index, not these files directly. Only ingest.py reads them.
+docs/
