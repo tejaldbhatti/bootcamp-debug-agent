@@ -42,7 +42,7 @@ def _mcp_tools_to_openai_format(mcp_tools):
 MAX_TOOL_ROUNDS = 4  # resolve-library-id, then get-library-docs, plus headroom
 
 
-async def resolve_via_mcp(question: str) -> str | None:
+async def resolve_via_mcp(question: str, on_usage=None) -> str | None:
     """
     Ask GPT whether Context7's tools can help answer this question, and
     if so, let it call them — looping so it can chain calls (e.g.
@@ -50,6 +50,10 @@ async def resolve_via_mcp(question: str) -> str | None:
     instead of stopping after a single tool call. Returns the combined
     tool result text, or None if GPT decides no tool is relevant, or
     no round ever returns real content.
+
+    `on_usage`, if given, is called with each OpenAI response's
+    `.usage` object as calls happen, so callers can track token cost
+    across the (possibly multi-round) tool-calling loop.
     """
     try:
         async with streamable_http_client(CONTEXT7_URL) as (read, write):
@@ -82,6 +86,8 @@ async def resolve_via_mcp(question: str) -> str | None:
                         messages=messages,
                         tools=openai_tools,
                     )
+                    if on_usage:
+                        on_usage(response.usage)
                     message = response.choices[0].message
 
                     if not message.tool_calls:

@@ -1,36 +1,49 @@
 # Bootcamp Debug Agent
 
-A Slack support bot for an AI bootcamp. Students post errors in
-`#ask-for-support`; the agent answers using RAG over a troubleshooting
-knowledge base, falls back to a live MCP (Context7) documentation
-lookup when RAG isn't confident, and escalates to a human TA when
-neither finds a solid answer. Follow-up questions in the same Slack
-thread keep context via lightweight thread memory.
+An AI support agent for a bootcamp's Slack channel. Students post
+errors; it answers from an internal RAG knowledge base, falls back to
+live library docs via MCP when RAG isn't confident, keeps context
+across threaded follow-ups, and escalates to a human when neither
+source has a solid answer. Deployed and running in production.
 
-## How it works
+**Highlights**
+- Diagnosis logic modeled as an explicit **LangGraph** state machine (8 nodes, conditional routing) rather than nested if/else
+- **RAG** (Pinecone + OpenAI embeddings) with a GPT relevance check before trusting a retrieval, not just a similarity score
+- **Live doc fallback** via MCP (Context7), with a multi-round tool-calling loop for chained lookups
+- **Thread-aware**: Slack follow-ups keep conversation context; vague follow-ups get context-aware search
+- **Per-request cost tracking**: OpenAI $ cost estimated from actual token usage, logged per turn
+- **Vision**: screenshots described via GPT-4o before retrieval, so image-only reports still search well
+- Deployed on **Render**, orchestrated by **n8n** (Slack trigger → API → threaded reply + Google Sheets log), with shared-secret auth on the API
+
+## Contents
+1. [Architecture](#architecture)
+2. [Stack](#stack)
+3. [Project layout](#project-layout)
+4. [Local development](#local-development)
+5. [Deployment](#deployment)
+6. [Status](#status)
+
+## Architecture
 
 ```
 Slack message
       |
-Slack Trigger (n8n) --- filter out the bot's own messages
+n8n: Slack Trigger -> filter bot's own messages
       |
-Flask API (src/api.py) -> query.diagnose()
+Flask API (src/api.py) -> query.diagnose()  [LangGraph state machine]
       |
-Prior thread history (memory.py), if any
-      |
-Pinecone retrieval
-      |
-Minimum-score check -> GPT relevance check
-      |
-   +--+--+
-   |     |
-  RAG   MCP (Context7)      -- neither confident -> escalate to a TA
-   |     |
-   +--+--+
-      |
-   Answer
-      |
-Reply in the Slack thread + log to Google Sheets (n8n)
+retrieve -> too weak? --------------------+
+      |                                   |
+  relevance check --(not relevant)--------+
+      |(relevant)                         |
+  answer from RAG                    MCP (Context7)
+      |                              found? -> answer from MCP
+      |                              not found? -> escalate to a TA
+      +-------------------+-------------------+
+                           |
+        save thread memory + log (incl. cost)
+                           |
+        n8n: reply in Slack thread + log to Sheets
 ```
 
 ## Stack
@@ -38,161 +51,59 @@ Reply in the Slack thread + log to Google Sheets (n8n)
 | Piece | Role |
 |---|---|
 | Pinecone | Vector store for RAG |
-| OpenAI (GPT-4o) | Embeddings, answer generation, vision (screenshot errors) |
+| OpenAI (GPT-4o) | Embeddings, answers, vision, relevance checks |
+| LangGraph | Explicit state machine for the diagnosis pipeline |
 | MCP / Context7 | Live library documentation fallback |
-| n8n | Orchestration — Slack Trigger → Flask API → reply + log |
-| Flask (`src/api.py`) | Thin HTTP wrapper around `src/query.py` |
+| n8n | Orchestration: Slack Trigger → Flask API → reply + log |
+| Flask + Gunicorn | API, deployed on Render |
 
 ## Project layout
 
 ```
 bootcamp-debug-agent/
-├── README.md
-├── claude.md             # project context for AI coding assistants — local only, not committed
-├── requirements.txt
-├── .env.example
-├── n8n_workflow.json     # exported n8n workflow
-├── docs/                 # knowledge base source files — not committed, see below
-└── src/                  # all application code lives here
-    ├── api.py
-    ├── query.py
-    ├── memory.py
-    ├── mcp_fallback.py
-    ├── ingest.py
-    ├── slack_export.py
-    ├── test_mcp_fallback.py
-    └── test_vision.py
+├── requirements.txt / .env.example
+├── n8n_workflow.json      # exported n8n workflow
+├── docs/                  # knowledge base source — local only, not committed
+└── src/
+    ├── api.py             # POST /diagnose
+    ├── query.py           # LangGraph pipeline (the core of the project)
+    ├── mcp_fallback.py     # async MCP client
+    ├── memory.py          # per-thread Q&A history
+    ├── ingest.py           # docs/ -> Pinecone
+    └── slack_export.py     # optional: pull real Q&A from Slack history
 ```
 
-| File | Purpose |
-|---|---|
-| `src/query.py` | Core pipeline: retrieve → answer / MCP fallback / escalate. Has a `__main__` block for testing from the terminal, no Slack/n8n needed. |
-| `src/memory.py` | Stores the last few Q&A turns per Slack thread in `thread_memory.json`, so follow-ups have context. |
-| `src/mcp_fallback.py` | Async MCP client for Context7 (`resolve-library-id` → `get-library-docs`). Kept separate since it's the only async piece. |
-| `src/api.py` | Flask endpoint `POST /diagnose` — accepts `question`, `image_base64`, `thread_id`. |
-| `src/ingest.py` | Chunks and embeds everything in `docs/` into Pinecone. Run once, and again whenever docs change. |
-| `src/slack_export.py` | Optional: pulls real Q&A pairs out of Slack history into `docs/` (see note below on student data). |
-| `n8n_workflow.json` | Exported n8n workflow — Slack Trigger → bot-message filter → Call Diagnose API → reply in thread + log to Google Sheets. |
-| `docs/` | Knowledge base source files. **Not committed** — see below. |
-
-All commands below assume you run them from the repo root (`bootcamp-debug-agent/`), not from inside `src/` — the scripts locate `docs/`, `thread_memory.json`, and `support_log.csv` relative to the working directory they're run from.
-
-### About `docs/`
-
-The knowledge base is intentionally **not** pushed to GitHub (it's in
-`.gitignore`) since it's the bootcamp's own curriculum/troubleshooting
-content. It's also not needed at deploy time — the live app only
-queries the already-ingested Pinecone index, never these files
-directly. Only `ingest.py` reads `docs/`, and only when you're
-building or refreshing the index.
-
-If you're setting this up fresh, create a `docs/` folder locally and
-add your own `.md`/`.txt` notes before running `ingest.py` — see
-`docs/manual_qa.md`-style Q&A notes, or use `slack_export.py` to pull
-real threads (redact anything student-identifying first — see the
-warning in that section further down).
-
-## Setup
+## Local development
 
 ```bash
-cd bootcamp-debug-agent
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env           # fill in your real API keys — never commit .env
+cp .env.example .env            # fill in real API keys, never commit .env
 ```
 
-## 1. Build the knowledge base
-
-Pick whichever fits your access/comfort level:
-
-**Manual (recommended to start):** write real questions + working
-solutions into a `docs/*.md` file, in your own words, with no student
-names. Usually higher quality than a raw export, since you naturally
-keep only confirmed-working fixes.
-
-**Automated export** (needs a Slack bot token with channel history
-access):
-```bash
-python src/slack_export.py
-```
-Writes a Q&A markdown file with basic secret redaction applied
-automatically. This pulls raw message text, including student
-names/Slack IDs — check your Slack workspace's data policy before
-using this with real student data, and scrub identifying details
-before committing anything derived from it anywhere.
-
-## 2. Ingest into Pinecone
+Add your own notes under `docs/` (not included in the repo — see
+below), then:
 
 ```bash
-python src/ingest.py
+python src/ingest.py            # docs/ -> Pinecone
+python src/query.py             # CLI test, no Slack/n8n needed
+python src/api.py               # run the API locally on :5000
 ```
 
-Creates the Pinecone index if needed and uploads chunks from
-everything in `docs/`.
-
-## 3. Test the core logic standalone
-
-```bash
-python src/test_mcp_fallback.py   # optional: confirms Context7 works in isolation first
-python src/query.py               # full retrieve -> answer -> escalate loop, no Slack/n8n needed
-```
-
-A `support_log.csv` file will appear locally — a stand-in for the
-Google Sheets log during local testing.
-
-## 4. Wire up the full pipeline
-
-1. Start the API: `python src/api.py` (runs on `http://localhost:5000`)
-2. In n8n, import `n8n_workflow.json`
-3. Set your Slack channel ID, Slack credentials, and Google Sheets
-   credentials/spreadsheet ID in the relevant nodes
-4. If n8n runs somewhere other than your machine, replace
-   `http://localhost:5000` with a reachable URL (ngrok while testing;
-   see **Deployment** below for a stable alternative)
-5. Activate the workflow and test by posting in the Slack channel,
-   then replying in-thread to confirm follow-ups keep context
+`docs/` is intentionally not committed — it's the bootcamp's own
+curriculum content, and the deployed app queries Pinecone directly at
+runtime, never these files. Only `ingest.py` reads them.
 
 ## Deployment
 
-Not yet deployed — currently running locally and exposed via ngrok
-while testing. Planned: deploy `src/api.py` to Render so n8n has a
-stable URL instead of one that changes every time ngrok restarts.
-
-Notes for when that happens:
-
-- **Start command**: set Render's "Root Directory" to `src`, then use
-  `gunicorn -b 0.0.0.0:$PORT api:app` as the start command (Render
-  injects `$PORT`; Flask's built-in dev server isn't meant for
-  production use). Root Directory has to be `src` specifically —
-  `api.py` imports `query`/`memory` as flat sibling modules, so `src/`
-  itself needs to be the working directory for those imports to
-  resolve, the same way `python src/api.py` works locally.
-- **Env vars**: set `OPENAI_API_KEY`, `PINECONE_API_KEY`,
-  `SLACK_BOT_TOKEN`, `SLACK_SUPPORT_CHANNEL_ID`, and `API_SHARED_SECRET`
-  directly in Render's dashboard — never from a committed file.
-- **`API_SHARED_SECRET`**: set this once deployed (see `.env.example`)
-  and add a matching `X-API-Key` header in n8n's "Call Diagnose API"
-  node. Without it, `/diagnose` is open to anyone who finds the URL.
-- **`thread_memory.json` is not persistent on Render.** The default
-  web service filesystem is ephemeral — it resets on every redeploy,
-  and wouldn't be shared across instances if this ever scales past
-  one. In-thread follow-up context would reset when that happens. For
-  a support bot this is a reasonable tradeoff (context lost is a mild
-  inconvenience, not data loss), but it's worth knowing rather than
-  discovering by surprise. If long-term persistence matters later, a
-  Render persistent disk or a small hosted store (Redis, SQLite on a
-  disk) would replace the local JSON file.
+Live on Render. Key settings:
+- Root Directory: `src` · Start command: `gunicorn -b 0.0.0.0:$PORT api:app`
+- Env vars set in Render's dashboard: `OPENAI_API_KEY`, `PINECONE_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_SUPPORT_CHANNEL_ID`, `API_SHARED_SECRET`
+- `API_SHARED_SECRET` is checked against an `X-API-Key` header n8n sends — without it, `/diagnose` would be open to anyone with the URL
+- `thread_memory.json` is not persistent (Render's filesystem is ephemeral) — a redeploy resets in-thread context, a reasonable tradeoff for a support bot
 
 ## Status
 
-- Core logic (RAG, MCP fallback, escalation, thread memory) — working,
-  verified via CLI and through the full n8n → Slack pipeline
-- Slack thread replies — fixed: the n8n Reply node's "Reply to a
-  Message" timestamp expression was missing its `||` fallback
-  operator, causing every reply to post unthreaded; a bot-message
-  filter was also added right after the Slack Trigger node
-- Render deployment — repo is prepped (gunicorn added, `/diagnose`
-  supports optional shared-secret auth) but not yet deployed; the
-  Render service itself still needs to be created (see Deployment
-  above)
+Working end-to-end: RAG, MCP fallback, escalation, thread memory, cost
+tracking, and Slack threading are all verified in production through
+the full n8n → Render pipeline.

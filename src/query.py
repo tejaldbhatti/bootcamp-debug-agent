@@ -49,6 +49,57 @@ LOG_FILE = "support_log.csv"
 
 
 # ============================================================
+# COST TRACKING
+#
+# Rough per-request $ cost estimate from actual OpenAI token usage.
+# Rates below are per 1M tokens — check https://openai.com/api/pricing
+# and update if they've changed; treat these as good-enough-to-compare
+# requests against each other, not an exact invoice.
+#
+# Pinecone isn't included: serverless read-unit pricing depends on
+# returned payload size, not a flat $/query rate, and at this app's
+# scale it normally stays inside Pinecone's free tier anyway — a
+# hardcoded per-query number would be more misleading than useful.
+# ============================================================
+
+PRICING_PER_1M_TOKENS = {
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "text-embedding-3-small": {"input": 0.02, "output": 0.00},
+}
+
+
+class CostTracker:
+    """Accumulates estimated OpenAI $ cost across one diagnose() call."""
+
+    def __init__(self):
+        self.total_usd = 0.0
+        self.calls = []  # [(model, input_tokens, output_tokens, cost_usd), ...]
+
+    def add(self, model: str, usage) -> float:
+        """Record one API response's token usage. Safe to call with
+        usage=None (e.g. a failed/empty response) — adds nothing."""
+        if usage is None:
+            return 0.0
+
+        rates = PRICING_PER_1M_TOKENS.get(model)
+        if rates is None:
+            return 0.0
+
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        if input_tokens is None:
+            input_tokens = getattr(usage, "total_tokens", 0)
+        output_tokens = getattr(usage, "completion_tokens", 0)
+
+        cost = (
+            (input_tokens / 1_000_000) * rates["input"]
+            + (output_tokens / 1_000_000) * rates["output"]
+        )
+        self.total_usd += cost
+        self.calls.append((model, input_tokens, output_tokens, cost))
+        return cost
+
+
+# ============================================================
 # CLIENTS
 # ============================================================
 
@@ -91,12 +142,14 @@ def redact_secrets(text: str) -> str:
 # EMBEDDINGS
 # ============================================================
 
-def embed(text: str) -> list[float]:
+def embed(text: str, cost_tracker: CostTracker | None = None) -> list[float]:
     """Create an OpenAI embedding for the supplied text."""
     response = openai_client.embeddings.create(
         model=EMBED_MODEL,
         input=text
     )
+    if cost_tracker:
+        cost_tracker.add(EMBED_MODEL, response.usage)
     return response.data[0].embedding
 
 
@@ -104,9 +157,9 @@ def embed(text: str) -> list[float]:
 # PINECONE RETRIEVAL
 # ============================================================
 
-def retrieve(question: str):
+def retrieve(question: str, cost_tracker: CostTracker | None = None):
     """Search Pinecone for the most relevant document chunks."""
-    query_vector = embed(question)
+    query_vector = embed(question, cost_tracker)
     result = index.query(
         vector=query_vector,
         top_k=TOP_K,
@@ -175,7 +228,7 @@ SIMILARITY SCORE: {score:.4f}
 # RAG RELEVANCE CHECK
 # ============================================================
 
-def check_rag_relevance(question: str, matches) -> bool:
+def check_rag_relevance(question: str, matches, cost_tracker: CostTracker | None = None) -> bool:
     """
     Ask GPT whether the retrieved documentation contains enough
     information to answer the student's question. Better than relying
@@ -221,6 +274,8 @@ not contain enough information to answer the question.
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
+    if cost_tracker:
+        cost_tracker.add(CHAT_MODEL, response.usage)
 
     decision = response.choices[0].message.content.strip().upper()
     print(f"\nRAG relevance decision: {decision}")
@@ -285,7 +340,7 @@ Student question:
 # SCREENSHOT DESCRIPTION (runs before retrieval)
 # ============================================================
 
-def describe_screenshot(image_path: str) -> str:
+def describe_screenshot(image_path: str, cost_tracker: CostTracker | None = None) -> str:
     """
     Use vision to extract the actual error/content shown in a
     screenshot as plain text. Pinecone retrieval only works on text,
@@ -315,6 +370,8 @@ def describe_screenshot(image_path: str) -> str:
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": content}],
     )
+    if cost_tracker:
+        cost_tracker.add(CHAT_MODEL, response.usage)
     return response.choices[0].message.content
 
 
@@ -322,7 +379,7 @@ def describe_screenshot(image_path: str) -> str:
 # ASK GPT (now thread-aware)
 # ============================================================
 
-def ask_model(content, history: list[dict] | None = None) -> str:
+def ask_model(content, history: list[dict] | None = None, cost_tracker: CostTracker | None = None) -> str:
     """
     Send a prompt to GPT and return the answer. If `history` is given
     (prior turns from this Slack thread), it's included before the
@@ -334,6 +391,8 @@ def ask_model(content, history: list[dict] | None = None) -> str:
         model=CHAT_MODEL,
         messages=messages,
     )
+    if cost_tracker:
+        cost_tracker.add(CHAT_MODEL, response.usage)
     return response.choices[0].message.content
 
 
@@ -341,20 +400,27 @@ def ask_model(content, history: list[dict] | None = None) -> str:
 # CSV LOGGING
 # ============================================================
 
-def log_to_csv(question: str, answer: str, escalated: bool, source: str):
-    """Append the support request to support_log.csv."""
+def log_to_csv(question: str, answer: str, escalated: bool, source: str, cost_usd: float = 0.0):
+    """Append the support request to support_log.csv.
+
+    Note: if support_log.csv already exists from before the cost_usd
+    column was added, its older rows will have one fewer column than
+    new ones — fine for appending, but re-open in Excel/Sheets with
+    that in mind (or start a fresh file) if you're analyzing it there.
+    """
     file_exists = os.path.exists(LOG_FILE)
 
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "question", "answer", "escalated", "source"])
+            writer.writerow(["timestamp", "question", "answer", "escalated", "source", "cost_usd"])
         writer.writerow([
             datetime.now(timezone.utc).isoformat(),
             question,
             answer,
             escalated,
-            source
+            source,
+            f"{cost_usd:.6f}"
         ])
 
 
@@ -398,10 +464,12 @@ class DiagnoseState(TypedDict, total=False):
     best_score: float
     rag_is_relevant: bool
     mcp_result: str | None
+    cost_tracker: CostTracker
     # outputs
     answer: str
     escalated: bool
     source: str
+    cost_usd: float
 
 
 def node_redact_and_prepare(state: DiagnoseState) -> dict:
@@ -415,12 +483,14 @@ def node_redact_and_prepare(state: DiagnoseState) -> dict:
     print("\nStudent question:")
     print(state["question"])
 
+    cost_tracker = CostTracker()
+
     safe_question = redact_secrets(state["question"])
 
     image_path = state.get("image_path")
     if image_path:
         print("\nScreenshot provided — extracting error text via vision...")
-        screenshot_description = describe_screenshot(image_path)
+        screenshot_description = describe_screenshot(image_path, cost_tracker)
         print("\n--- SCREENSHOT DESCRIPTION (for debugging) ---")
         print(screenshot_description)
         print("--- END SCREENSHOT DESCRIPTION ---\n")
@@ -453,6 +523,7 @@ def node_redact_and_prepare(state: DiagnoseState) -> dict:
         "safe_question": safe_question,
         "history": history,
         "search_query": search_query,
+        "cost_tracker": cost_tracker,
     }
 
 
@@ -460,7 +531,7 @@ def node_retrieve(state: DiagnoseState) -> dict:
     """STEP 5: search Pinecone and record the best score."""
 
     print("\nSearching Pinecone...")
-    matches = retrieve(state["search_query"])
+    matches = retrieve(state["search_query"], state.get("cost_tracker"))
     print_matches(matches)
 
     best_score = matches[0]["score"] if matches else 0
@@ -489,7 +560,7 @@ def route_after_retrieve(state: DiagnoseState) -> str:
 def node_check_relevance(state: DiagnoseState) -> dict:
     """STEP 7: ask GPT whether the retrieved docs are actually useful."""
 
-    rag_is_relevant = check_rag_relevance(state["search_query"], state["matches"])
+    rag_is_relevant = check_rag_relevance(state["search_query"], state["matches"], state.get("cost_tracker"))
 
     if rag_is_relevant:
         print("\nRAG has enough information.")
@@ -507,7 +578,7 @@ def route_after_relevance(state: DiagnoseState) -> str:
 
 def node_answer_from_rag(state: DiagnoseState) -> dict:
     content = build_answer_prompt(state["safe_question"], state["matches"], state.get("image_path"))
-    answer = ask_model(content, history=state.get("history"))
+    answer = ask_model(content, history=state.get("history"), cost_tracker=state.get("cost_tracker"))
     answer = redact_secrets(answer)
     return {"answer": answer, "escalated": False, "source": "rag"}
 
@@ -516,7 +587,13 @@ def node_mcp_fallback(state: DiagnoseState) -> dict:
     """STEP 8: call Context7 through MCP. Reached either directly from
     a too-weak Pinecone result, or after RAG was found not relevant."""
 
-    mcp_result = asyncio.run(resolve_via_mcp(state["search_query"]))
+    cost_tracker = state.get("cost_tracker")
+
+    def _track_usage(usage):
+        if cost_tracker:
+            cost_tracker.add(CHAT_MODEL, usage)
+
+    mcp_result = asyncio.run(resolve_via_mcp(state["search_query"], on_usage=_track_usage))
 
     if mcp_result:
         print("\nMCP returned documentation.")
@@ -549,7 +626,7 @@ def node_answer_from_mcp(state: DiagnoseState) -> dict:
         ),
     }]
 
-    answer = ask_model(content, history=state.get("history"))
+    answer = ask_model(content, history=state.get("history"), cost_tracker=state.get("cost_tracker"))
     answer = redact_secrets(answer)
     return {"answer": answer, "escalated": False, "source": "mcp_fallback"}
 
@@ -563,11 +640,17 @@ def node_escalate(state: DiagnoseState) -> dict:
 
 
 def node_finalize(state: DiagnoseState) -> dict:
-    """STEP 9-10: save this turn to thread memory and log the result."""
+    """STEP 9-10: save this turn to thread memory and log the result,
+    including the estimated OpenAI cost accumulated across every node
+    this request passed through."""
+
+    cost_tracker = state.get("cost_tracker")
+    cost_usd = cost_tracker.total_usd if cost_tracker else 0.0
+    print(f"\nEstimated OpenAI cost for this request: ${cost_usd:.6f}")
 
     add_turn(state.get("thread_id"), state["safe_question"], state["answer"])
-    log_to_csv(state["safe_question"], state["answer"], state["escalated"], state["source"])
-    return {}
+    log_to_csv(state["safe_question"], state["answer"], state["escalated"], state["source"], cost_usd)
+    return {"cost_usd": cost_usd}
 
 
 def _build_graph():
