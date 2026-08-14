@@ -1,0 +1,248 @@
+{
+  "name": "Bootcamp Debug Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "trigger": [
+          "app_mention",
+          "message"
+        ],
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "C0BPRLSKE8H"
+        },
+        "options": {}
+      },
+      "id": "b25d530b-0eb5-44ef-9780-3fde8ac75dae",
+      "name": "Slack Trigger",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [
+        448,
+        192
+      ],
+      "webhookId": "a00eb15a-c747-47b6-9610-3deea478eb3f",
+      "credentials": {
+        "slackApi": {
+          "id": "6qxBRyUvq4q5nWWu",
+          "name": "Slack account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://angelica-joyless-overconservatively.ngrok-free.dev/diagnose",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"question\": $json.text, \"thread_id\": $json.thread_ts || $json.ts } }}",
+        "options": {}
+      },
+      "id": "40dd88bf-b166-46fb-9bde-6c0b1a625ad4",
+      "name": "Call Diagnose API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        912,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BPRLSKE8H",
+          "mode": "id"
+        },
+        "text": "={{ $json.answer }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": true,
+          "thread_ts": {
+            "replyValues": {
+              "thread_ts": "={{ $('Slack Trigger').item.json.thread_ts || $('Slack Trigger').item.json.ts }}\n"
+            }
+          },
+          "sendAsUser": "="
+        }
+      },
+      "id": "99c8342f-7f15-4a5f-b90a-09128b703010",
+      "name": "Reply in Slack Thread",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        80
+      ],
+      "webhookId": "1a00f4f9-d6fc-49a8-a595-016f791c2d6d",
+      "credentials": {
+        "slackApi": {
+          "id": "6qxBRyUvq4q5nWWu",
+          "name": "Slack account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1YXgKbW7oPYhHCvAYK_2broGTlXp9WbWpT84lUU4QPWs",
+          "mode": "list",
+          "cachedResultName": "debug_agent",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1YXgKbW7oPYhHCvAYK_2broGTlXp9WbWpT84lUU4QPWs/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Log",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1YXgKbW7oPYhHCvAYK_2broGTlXp9WbWpT84lUU4QPWs/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "answer": "={{ $json.answer }}",
+            "escalated": "={{ $json.escalated }}",
+            "question": "={{ $('Slack Trigger').item.json.blocks[0].elements[0].elements[1].text }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "question",
+              "displayName": "question",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "answer",
+              "displayName": "answer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "escalated",
+              "displayName": "escalated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "40f1e6bd-cc71-42a0-a808-c923505c1efa",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        1152,
+        288
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "pmlknSC85uZpAKzQ",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "08ccd9fb-1b73-49b6-9472-b665d497ce93",
+              "leftValue": "={{ $json.bot_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        656,
+        192
+      ],
+      "id": "cfd5f879-2b57-4823-a99f-88fdc6a50b39",
+      "name": "If"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Slack Trigger": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Diagnose API": {
+      "main": [
+        [
+          {
+            "node": "Reply in Slack Thread",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Call Diagnose API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "6a657f62-0f78-4a08-bcf5-1883e616caa0",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "00cafa1eb8a383ac595b6bbf54c5f8acd05d9d1462911bd4a0edac031509b829"
+  },
+  "id": "9duJcWVix1f4dWg2",
+  "tags": []
+}

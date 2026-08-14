@@ -1,0 +1,27 @@
+# Secrets — never commit real API keys
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Runtime-generated files — contain real student conversation data,
+# shouldn't live in git even in a private repo
+thread_memory.json
+support_log.csv
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+*.swp
+
+# Debugging screenshots — may contain credentials/PII, not meant for the repo
+screenshot.png
+
+# ngrok config, if you ever export one
+ngrok.yml

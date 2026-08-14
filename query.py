@@ -1,0 +1,626 @@
+"""
+Core logic for one support request:
+
+1. Retrieve relevant document chunks from Pinecone.
+2. Check whether the retrieved context is sufficient to answer the question.
+3. If RAG can answer -> answer using the internal documentation.
+4. If RAG cannot answer -> use Context7 through MCP as a fallback.
+5. Optionally analyze a screenshot.
+6. Pull in prior turns from this Slack thread (if any) for continuity.
+7. Log the result to a local CSV.
+
+This file has no Slack/n8n code on purpose.
+"""
+
+import os
+import re
+import csv
+import base64
+import asyncio
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from pinecone import Pinecone
+
+from mcp_fallback import resolve_via_mcp
+from memory import get_history, add_turn
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+CHAT_MODEL = "gpt-4o"
+EMBED_MODEL = "text-embedding-3-small"
+
+# Number of Pinecone chunks to retrieve
+TOP_K = 4
+
+# We use this only as a minimum safety filter.
+# It is NOT the final RAG decision.
+MIN_RAG_SCORE = 0.40
+
+LOG_FILE = "support_log.csv"
+
+
+# ============================================================
+# CLIENTS
+# ============================================================
+
+openai_client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"]
+)
+
+pc = Pinecone(
+    api_key=os.environ["PINECONE_API_KEY"]
+)
+
+INDEX_NAME = os.environ.get(
+    "PINECONE_INDEX_NAME",
+    "bootcamp-debug-agent"
+)
+
+index = pc.Index(INDEX_NAME)
+
+
+# ============================================================
+# SECRET REDACTION
+# ============================================================
+
+SECRET_PATTERNS = [
+    r"sk-[a-zA-Z0-9]{20,}",              # OpenAI-style keys
+    r"AKIA[0-9A-Z]{16}",                # AWS access key IDs
+    r"ghp_[a-zA-Z0-9]{30,}",             # GitHub tokens
+    r"xox[baprs]-[a-zA-Z0-9-]{10,}",     # Slack tokens
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Replace obvious API keys/tokens with [REDACTED]."""
+    for pattern in SECRET_PATTERNS:
+        text = re.sub(pattern, "[REDACTED]", text)
+    return text
+
+
+# ============================================================
+# EMBEDDINGS
+# ============================================================
+
+def embed(text: str) -> list[float]:
+    """Create an OpenAI embedding for the supplied text."""
+    response = openai_client.embeddings.create(
+        model=EMBED_MODEL,
+        input=text
+    )
+    return response.data[0].embedding
+
+
+# ============================================================
+# PINECONE RETRIEVAL
+# ============================================================
+
+def retrieve(question: str):
+    """Search Pinecone for the most relevant document chunks."""
+    query_vector = embed(question)
+    result = index.query(
+        vector=query_vector,
+        top_k=TOP_K,
+        include_metadata=True
+    )
+    return result["matches"]
+
+
+# ============================================================
+# DEBUG DISPLAY
+# ============================================================
+
+def print_matches(matches):
+    """Print retrieved Pinecone chunks to the terminal (dev aid)."""
+    print("\n" + "=" * 70)
+    print("PINECONE RETRIEVAL RESULTS")
+    print("=" * 70)
+
+    if not matches:
+        print("No matches found.")
+        return
+
+    for i, match in enumerate(matches, start=1):
+        score = match.get("score", 0)
+        metadata = match.get("metadata", {})
+        source = metadata.get("source", "unknown")
+        text = metadata.get("text", "")
+
+        print(f"\nResult #{i}")
+        print(f"Score  : {score:.4f}")
+        print(f"Source : {source}")
+        print(f"Text   : {text[:1000]}")
+
+    print("\n" + "=" * 70)
+
+
+# ============================================================
+# BUILD RAG CONTEXT
+# ============================================================
+
+def build_context(matches) -> str:
+    """Convert Pinecone matches into readable context for GPT."""
+    if not matches:
+        return ""
+
+    context_parts = []
+    for match in matches:
+        metadata = match.get("metadata", {})
+        source = metadata.get("source", "unknown")
+        text = metadata.get("text", "")
+        score = match.get("score", 0)
+
+        context_parts.append(
+            f"""
+SOURCE: {source}
+SIMILARITY SCORE: {score:.4f}
+
+{text}
+"""
+        )
+
+    return "\n\n---\n\n".join(context_parts)
+
+
+# ============================================================
+# RAG RELEVANCE CHECK
+# ============================================================
+
+def check_rag_relevance(question: str, matches) -> bool:
+    """
+    Ask GPT whether the retrieved documentation contains enough
+    information to answer the student's question. Better than relying
+    only on the Pinecone similarity score.
+    """
+    context = build_context(matches)
+    if not context:
+        return False
+
+    prompt = f"""
+You are evaluating whether an internal knowledge base can answer
+a student's technical support question.
+
+Student question:
+{question}
+
+Retrieved internal documentation:
+{context}
+
+Your task:
+
+Determine whether the retrieved documentation contains enough
+specific and useful information to answer the student's question.
+
+Return ONLY one word:
+
+YES
+
+or
+
+NO
+
+Return YES if the documentation contains a direct answer,
+relevant troubleshooting steps, configuration information,
+examples, or enough information to construct a reliable answer.
+
+Return NO if the documentation is unrelated, too vague, or does
+not contain enough information to answer the question.
+"""
+
+    response = openai_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    decision = response.choices[0].message.content.strip().upper()
+    print(f"\nRAG relevance decision: {decision}")
+
+    return decision.startswith("YES")
+
+
+# ============================================================
+# BUILD RAG ANSWER PROMPT
+# ============================================================
+
+def build_answer_prompt(question: str, matches, image_path: str | None):
+    """Build the prompt used when RAG has enough information."""
+    context = build_context(matches)
+
+    text_prompt = f"""
+You are a helpful teaching assistant for an AI bootcamp.
+
+A student has asked a technical support question.
+
+Use ONLY the internal documentation provided below to answer
+the student's question.
+
+Do NOT invent information that is not supported by the
+documentation.
+
+Give the student a clear, systematic troubleshooting answer.
+
+When appropriate:
+
+1. Start with the most likely cause.
+2. Give numbered troubleshooting steps.
+3. Tell the student exactly where to check something.
+4. Explain what the student should expect to see.
+5. Explain what to do if the check fails.
+6. Mention the exact error message when it is available.
+7. Ask for a screenshot/error message only when necessary.
+
+Internal documentation:
+
+{context}
+
+Student question:
+
+{question}
+"""
+
+    content = [{"type": "text", "text": text_prompt}]
+
+    if image_path:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+        })
+
+    return content
+
+
+# ============================================================
+# SCREENSHOT DESCRIPTION (runs before retrieval)
+# ============================================================
+
+def describe_screenshot(image_path: str) -> str:
+    """
+    Use vision to extract the actual error/content shown in a
+    screenshot as plain text. Pinecone retrieval only works on text,
+    so without this step, a vague accompanying message (e.g. "see
+    screenshot") gives retrieval nothing useful to search on and the
+    image content is effectively ignored.
+    """
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "This is a screenshot a student shared along with a "
+                "technical support question. Describe, in plain text, "
+                "exactly what error message(s), tool names, and relevant "
+                "details are visible in this image. Quote the exact error "
+                "text if it's visible. Don't diagnose or suggest a fix — "
+                "just describe what's shown, factually."
+            ),
+        },
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]
+
+    response = openai_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "user", "content": content}],
+    )
+    return response.choices[0].message.content
+
+
+# ============================================================
+# ASK GPT (now thread-aware)
+# ============================================================
+
+def ask_model(content, history: list[dict] | None = None) -> str:
+    """
+    Send a prompt to GPT and return the answer. If `history` is given
+    (prior turns from this Slack thread), it's included before the
+    current message so follow-up questions have context.
+    """
+    messages = (history or []) + [{"role": "user", "content": content}]
+
+    response = openai_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+    )
+    return response.choices[0].message.content
+
+
+# ============================================================
+# CSV LOGGING
+# ============================================================
+
+def log_to_csv(question: str, answer: str, escalated: bool, source: str):
+    """Append the support request to support_log.csv."""
+    file_exists = os.path.exists(LOG_FILE)
+
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "question", "answer", "escalated", "source"])
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            question,
+            answer,
+            escalated,
+            source
+        ])
+
+
+# ============================================================
+# MAIN DIAGNOSIS PIPELINE
+# ============================================================
+
+def diagnose(
+    question: str,
+    image_path: str | None = None,
+    thread_id: str | None = None,
+) -> dict:
+    """
+    Main support pipeline.
+
+    `thread_id` should be the Slack thread's root timestamp (thread_ts,
+    or the message's own ts if it's the first message in the thread).
+    Pass None (e.g. from the CLI test) to skip memory entirely.
+
+    Flow:
+
+        Question
+            |
+        Prior thread history (if any)
+            |
+        Pinecone
+            |
+        Retrieve chunks
+            |
+        Minimum score check
+            |
+        GPT relevance check
+            |
+       +----+----+
+       |         |
+      RAG       MCP
+       |         |
+       +----+----+
+            |
+          Answer
+    """
+
+    print("\n" + "=" * 70)
+    print("BOOTCAMP DEBUG AGENT")
+    print("=" * 70)
+
+    print("\nStudent question:")
+    print(question)
+
+    # --------------------------------------------------------
+    # STEP 1 — Redact secrets
+    # --------------------------------------------------------
+
+    safe_question = redact_secrets(question)
+
+    # --------------------------------------------------------
+    # STEP 1B — If a screenshot was provided, describe it via vision
+    # BEFORE retrieval, so RAG/MCP search on the real error content
+    # instead of whatever (possibly vague) text the student typed.
+    # --------------------------------------------------------
+
+    if image_path:
+        print("\nScreenshot provided — extracting error text via vision...")
+        screenshot_description = describe_screenshot(image_path)
+        print("\n--- SCREENSHOT DESCRIPTION (for debugging) ---")
+        print(screenshot_description)
+        print("--- END SCREENSHOT DESCRIPTION ---\n")
+        safe_question = (
+            f"{safe_question}\n\n[What the screenshot shows]:\n{screenshot_description}"
+        )
+
+    # --------------------------------------------------------
+    # STEP 2 — Load prior turns from this thread, if any
+    # --------------------------------------------------------
+
+    history = get_history(thread_id)
+    if history:
+        print(f"\nLoaded {len(history) // 2} prior turn(s) from this thread.")
+
+    # --------------------------------------------------------
+    # STEP 2B — Build a context-aware search query. Retrieval and MCP
+    # only ever see the raw question text, so a vague follow-up like
+    # "does that work on Mac too?" has nothing to search on by itself.
+    # Combine it with the most recent exchange so search actually has
+    # something to work with. (safe_question stays the clean text used
+    # for logging/display — this is only for search.)
+    # --------------------------------------------------------
+
+    if history:
+        last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+        last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+        search_query = (
+            f"Earlier in this conversation:\n"
+            f"Q: {last_user}\nA: {last_assistant}\n\n"
+            f"Follow-up question: {safe_question}"
+        )
+        print("\nFollow-up detected — using conversation context for search.")
+    else:
+        search_query = safe_question
+
+    # --------------------------------------------------------
+    # STEP 3 — Search Pinecone
+    # --------------------------------------------------------
+
+    print("\nSearching Pinecone...")
+    matches = retrieve(search_query)
+    print_matches(matches)
+
+    # --------------------------------------------------------
+    # STEP 4 — Check best Pinecone score
+    # --------------------------------------------------------
+
+    best_score = matches[0]["score"] if matches else 0
+
+    print(f"\nBest Pinecone score: {best_score:.4f}")
+    print(f"Minimum RAG score: {MIN_RAG_SCORE}")
+
+    source = "rag"
+
+    # --------------------------------------------------------
+    # STEP 5 — If Pinecone result is extremely weak, skip
+    #          straight to the MCP fallback.
+    # --------------------------------------------------------
+
+    if not matches or best_score < MIN_RAG_SCORE:
+        print("\nRAG retrieval is too weak.")
+        print("-> Switching to MCP / Context7...")
+
+        mcp_result = asyncio.run(resolve_via_mcp(search_query))
+
+        if mcp_result:
+            print("\nMCP returned documentation.")
+            print("-> Asking GPT to formulate the answer.")
+            print("\n--- RAW MCP RESULT (for debugging) ---")
+            print(mcp_result[:3000])
+            print("--- END RAW MCP RESULT ---\n")
+
+            content = [{
+                "type": "text",
+                "text": (
+                    "You are a helpful teaching assistant for an AI bootcamp.\n\n"
+                    "Use ONLY the documentation below to answer the student's "
+                    "question. Do NOT use your own training knowledge about "
+                    "this library, even if you think you remember how it "
+                    "works — libraries change, and your training data may "
+                    "be outdated. If the documentation below doesn't clearly "
+                    "answer the question, say so honestly instead of "
+                    "guessing from memory.\n\n"
+                    f"Documentation:\n{mcp_result}\n\n"
+                    f"Student question:\n{safe_question}"
+                ),
+            }]
+
+            answer = ask_model(content, history=history)
+            answer = redact_secrets(answer)
+            escalated = False
+            source = "mcp_fallback"
+
+        else:
+            answer = (
+                "I couldn't find a confident answer in the available "
+                "documentation. A TA needs to take a look at this."
+            )
+            escalated = True
+            source = "escalated"
+
+    else:
+        # ----------------------------------------------------
+        # STEP 6 — Ask GPT if RAG context is actually useful
+        # ----------------------------------------------------
+
+        print("\nRAG retrieved potentially relevant documentation.")
+        print("-> Checking whether the documentation can answer the question...")
+
+        rag_is_relevant = check_rag_relevance(search_query, matches)
+
+        if rag_is_relevant:
+            print("\nRAG has enough information.")
+            print("-> Generating answer from internal documentation.")
+
+            content = build_answer_prompt(safe_question, matches, image_path)
+            answer = ask_model(content, history=history)
+            answer = redact_secrets(answer)
+            escalated = False
+            source = "rag"
+
+        else:
+            print("\nRAG does not have enough information.")
+            print("-> Switching to MCP / Context7...")
+
+            mcp_result = asyncio.run(resolve_via_mcp(search_query))
+
+            if mcp_result:
+                print("\nMCP returned documentation.")
+                print("-> Asking GPT to formulate the answer.")
+                print("\n--- RAW MCP RESULT (for debugging) ---")
+                print(mcp_result[:3000])
+                print("--- END RAW MCP RESULT ---\n")
+
+                content = [{
+                    "type": "text",
+                    "text": (
+                        "You are a helpful teaching assistant for an AI bootcamp.\n\n"
+                        "Use ONLY the documentation below to answer the student's "
+                        "question. Do NOT use your own training knowledge about "
+                        "this library, even if you think you remember how it "
+                        "works — libraries change, and your training data may "
+                        "be outdated. If the documentation below doesn't clearly "
+                        "answer the question, say so honestly instead of "
+                        "guessing from memory.\n\n"
+                        f"Documentation:\n{mcp_result}\n\n"
+                        f"Student question:\n{safe_question}"
+                    ),
+                }]
+
+                answer = ask_model(content, history=history)
+                answer = redact_secrets(answer)
+                escalated = False
+                source = "mcp_fallback"
+
+            else:
+                answer = (
+                    "I couldn't find a confident answer in the available "
+                    "documentation. A TA needs to take a look at this."
+                )
+                escalated = True
+                source = "escalated"
+
+    # --------------------------------------------------------
+    # STEP 7 — Save this turn to thread memory
+    # --------------------------------------------------------
+
+    add_turn(thread_id, safe_question, answer)
+
+    # --------------------------------------------------------
+    # STEP 8 — Log result
+    # --------------------------------------------------------
+
+    log_to_csv(safe_question, answer, escalated, source)
+
+    # --------------------------------------------------------
+    # STEP 9 — Return result
+    # --------------------------------------------------------
+
+    return {
+        "answer": answer,
+        "escalated": escalated,
+        "best_score": best_score,
+        "source": source
+    }
+
+
+# ============================================================
+# COMMAND LINE TEST
+# ============================================================
+
+if __name__ == "__main__":
+    thread_id = input("Thread ID (leave blank to skip memory): ").strip() or None
+    question = input("Student question: ")
+
+    result = diagnose(question, thread_id=thread_id)
+
+    print("\n" + "=" * 70)
+    print("FINAL RESULT")
+    print("=" * 70)
+
+    print(f"\nSource: {result['source']}")
+    print(f"Best RAG score: {result['best_score']:.4f}")
+    print(f"Escalated: {result['escalated']}")
+    print("\nAnswer:")
+    print(result["answer"])
