@@ -30,3 +30,6 @@ ngrok.yml
 # Not needed at runtime: the deployed app queries the already-ingested
 # Pinecone index, not these files directly. Only ingest.py reads them.
 docs/
+
+# AI coding assistant project context — kept local only, not published.
+claude.md

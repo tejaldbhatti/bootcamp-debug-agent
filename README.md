@@ -14,7 +14,7 @@ Slack message
       |
 Slack Trigger (n8n) --- filter out the bot's own messages
       |
-Flask API (api.py) -> query.diagnose()
+Flask API (src/api.py) -> query.diagnose()
       |
 Prior thread history (memory.py), if any
       |
@@ -41,20 +41,41 @@ Reply in the Slack thread + log to Google Sheets (n8n)
 | OpenAI (GPT-4o) | Embeddings, answer generation, vision (screenshot errors) |
 | MCP / Context7 | Live library documentation fallback |
 | n8n | Orchestration — Slack Trigger → Flask API → reply + log |
-| Flask (`api.py`) | Thin HTTP wrapper around `query.py` |
+| Flask (`src/api.py`) | Thin HTTP wrapper around `src/query.py` |
 
 ## Project layout
 
+```
+bootcamp-debug-agent/
+├── README.md
+├── claude.md             # project context for AI coding assistants — local only, not committed
+├── requirements.txt
+├── .env.example
+├── n8n_workflow.json     # exported n8n workflow
+├── docs/                 # knowledge base source files — not committed, see below
+└── src/                  # all application code lives here
+    ├── api.py
+    ├── query.py
+    ├── memory.py
+    ├── mcp_fallback.py
+    ├── ingest.py
+    ├── slack_export.py
+    ├── test_mcp_fallback.py
+    └── test_vision.py
+```
+
 | File | Purpose |
 |---|---|
-| `query.py` | Core pipeline: retrieve → answer / MCP fallback / escalate. Has a `__main__` block for testing from the terminal, no Slack/n8n needed. |
-| `memory.py` | Stores the last few Q&A turns per Slack thread in `thread_memory.json`, so follow-ups have context. |
-| `mcp_fallback.py` | Async MCP client for Context7 (`resolve-library-id` → `get-library-docs`). Kept separate since it's the only async piece. |
-| `api.py` | Flask endpoint `POST /diagnose` — accepts `question`, `image_base64`, `thread_id`. |
-| `ingest.py` | Chunks and embeds everything in `docs/` into Pinecone. Run once, and again whenever docs change. |
-| `slack_export.py` | Optional: pulls real Q&A pairs out of Slack history into `docs/` (see note below on student data). |
+| `src/query.py` | Core pipeline: retrieve → answer / MCP fallback / escalate. Has a `__main__` block for testing from the terminal, no Slack/n8n needed. |
+| `src/memory.py` | Stores the last few Q&A turns per Slack thread in `thread_memory.json`, so follow-ups have context. |
+| `src/mcp_fallback.py` | Async MCP client for Context7 (`resolve-library-id` → `get-library-docs`). Kept separate since it's the only async piece. |
+| `src/api.py` | Flask endpoint `POST /diagnose` — accepts `question`, `image_base64`, `thread_id`. |
+| `src/ingest.py` | Chunks and embeds everything in `docs/` into Pinecone. Run once, and again whenever docs change. |
+| `src/slack_export.py` | Optional: pulls real Q&A pairs out of Slack history into `docs/` (see note below on student data). |
 | `n8n_workflow.json` | Exported n8n workflow — Slack Trigger → bot-message filter → Call Diagnose API → reply in thread + log to Google Sheets. |
 | `docs/` | Knowledge base source files. **Not committed** — see below. |
+
+All commands below assume you run them from the repo root (`bootcamp-debug-agent/`), not from inside `src/` — the scripts locate `docs/`, `thread_memory.json`, and `support_log.csv` relative to the working directory they're run from.
 
 ### About `docs/`
 
@@ -93,7 +114,7 @@ keep only confirmed-working fixes.
 **Automated export** (needs a Slack bot token with channel history
 access):
 ```bash
-python slack_export.py
+python src/slack_export.py
 ```
 Writes a Q&A markdown file with basic secret redaction applied
 automatically. This pulls raw message text, including student
@@ -104,7 +125,7 @@ before committing anything derived from it anywhere.
 ## 2. Ingest into Pinecone
 
 ```bash
-python ingest.py
+python src/ingest.py
 ```
 
 Creates the Pinecone index if needed and uploads chunks from
@@ -113,8 +134,8 @@ everything in `docs/`.
 ## 3. Test the core logic standalone
 
 ```bash
-python test_mcp_fallback.py   # optional: confirms Context7 works in isolation first
-python query.py               # full retrieve -> answer -> escalate loop, no Slack/n8n needed
+python src/test_mcp_fallback.py   # optional: confirms Context7 works in isolation first
+python src/query.py               # full retrieve -> answer -> escalate loop, no Slack/n8n needed
 ```
 
 A `support_log.csv` file will appear locally — a stand-in for the
@@ -122,7 +143,7 @@ Google Sheets log during local testing.
 
 ## 4. Wire up the full pipeline
 
-1. Start the API: `python api.py` (runs on `http://localhost:5000`)
+1. Start the API: `python src/api.py` (runs on `http://localhost:5000`)
 2. In n8n, import `n8n_workflow.json`
 3. Set your Slack channel ID, Slack credentials, and Google Sheets
    credentials/spreadsheet ID in the relevant nodes
