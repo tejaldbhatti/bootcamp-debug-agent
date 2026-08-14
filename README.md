@@ -1,6 +1,6 @@
 # Bootcamp Debug Agent
 
-A Slack support bot for an Ironhack AI bootcamp. Students post errors in
+A Slack support bot for an AI bootcamp. Students post errors in
 `#ask-for-support`; the agent answers using RAG over a troubleshooting
 knowledge base, falls back to a live MCP (Context7) documentation
 lookup when RAG isn't confident, and escalates to a human TA when

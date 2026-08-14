@@ -1,7 +1,7 @@
 # Bootcamp Debug Agent — Project Context
 
 ## What this is
-A Slack support bot for an Ironhack AI bootcamp. Students post errors in
+A Slack support bot for an AI bootcamp. Students post errors in
 `#ask-for-support`, and this agent tries to answer using RAG over a
 knowledge base of troubleshooting docs, falling back to a live MCP
 (Context7) documentation lookup, and escalating to a human TA if neither
