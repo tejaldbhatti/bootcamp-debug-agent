@@ -18,10 +18,12 @@ import csv
 import base64
 import asyncio
 from datetime import datetime, timezone
+from typing import TypedDict
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from pinecone import Pinecone
+from langgraph.graph import StateGraph, START, END
 
 from mcp_fallback import resolve_via_mcp
 from memory import get_history, add_turn
@@ -357,63 +359,65 @@ def log_to_csv(question: str, answer: str, escalated: bool, source: str):
 
 
 # ============================================================
-# MAIN DIAGNOSIS PIPELINE
+# LANGGRAPH STATE MACHINE
+#
+# Same pipeline as before, expressed as an explicit graph instead of
+# nested if/else. Flow:
+#
+#     redact_and_prepare
+#           |
+#        retrieve
+#        /      \
+#  (too weak)  check_relevance
+#       |        /        \
+#       |   (relevant)  (not relevant)
+#       |       |             |
+#       |  answer_from_rag    |
+#       |       |             |
+#        \      |            /
+#         mcp_fallback <-----
+#         /          \
+#    (found)      (not found)
+#       |               |
+# answer_from_mcp    escalate
+#       \               /
+#        \             /
+#          finalize
 # ============================================================
 
-def diagnose(
-    question: str,
-    image_path: str | None = None,
-    thread_id: str | None = None,
-) -> dict:
-    """
-    Main support pipeline.
+class DiagnoseState(TypedDict, total=False):
+    # inputs
+    question: str
+    image_path: str | None
+    thread_id: str | None
+    # working state, filled in as nodes run
+    safe_question: str
+    history: list[dict]
+    search_query: str
+    matches: list
+    best_score: float
+    rag_is_relevant: bool
+    mcp_result: str | None
+    # outputs
+    answer: str
+    escalated: bool
+    source: str
 
-    `thread_id` should be the Slack thread's root timestamp (thread_ts,
-    or the message's own ts if it's the first message in the thread).
-    Pass None (e.g. from the CLI test) to skip memory entirely.
 
-    Flow:
-
-        Question
-            |
-        Prior thread history (if any)
-            |
-        Pinecone
-            |
-        Retrieve chunks
-            |
-        Minimum score check
-            |
-        GPT relevance check
-            |
-       +----+----+
-       |         |
-      RAG       MCP
-       |         |
-       +----+----+
-            |
-          Answer
-    """
+def node_redact_and_prepare(state: DiagnoseState) -> dict:
+    """STEP 1-4: redact secrets, describe screenshot, load thread
+    history, and build a context-aware search query for follow-ups."""
 
     print("\n" + "=" * 70)
     print("BOOTCAMP DEBUG AGENT")
     print("=" * 70)
 
     print("\nStudent question:")
-    print(question)
+    print(state["question"])
 
-    # --------------------------------------------------------
-    # STEP 1 — Redact secrets
-    # --------------------------------------------------------
+    safe_question = redact_secrets(state["question"])
 
-    safe_question = redact_secrets(question)
-
-    # --------------------------------------------------------
-    # STEP 1B — If a screenshot was provided, describe it via vision
-    # BEFORE retrieval, so RAG/MCP search on the real error content
-    # instead of whatever (possibly vague) text the student typed.
-    # --------------------------------------------------------
-
+    image_path = state.get("image_path")
     if image_path:
         print("\nScreenshot provided — extracting error text via vision...")
         screenshot_description = describe_screenshot(image_path)
@@ -424,23 +428,15 @@ def diagnose(
             f"{safe_question}\n\n[What the screenshot shows]:\n{screenshot_description}"
         )
 
-    # --------------------------------------------------------
-    # STEP 2 — Load prior turns from this thread, if any
-    # --------------------------------------------------------
-
-    history = get_history(thread_id)
+    history = get_history(state.get("thread_id"))
     if history:
         print(f"\nLoaded {len(history) // 2} prior turn(s) from this thread.")
 
-    # --------------------------------------------------------
-    # STEP 2B — Build a context-aware search query. Retrieval and MCP
-    # only ever see the raw question text, so a vague follow-up like
-    # "does that work on Mac too?" has nothing to search on by itself.
-    # Combine it with the most recent exchange so search actually has
-    # something to work with. (safe_question stays the clean text used
-    # for logging/display — this is only for search.)
-    # --------------------------------------------------------
-
+    # Retrieval and MCP only ever see the raw question text, so a vague
+    # follow-up like "does that work on Mac too?" has nothing to search
+    # on by itself. Combine it with the most recent exchange so search
+    # actually has something to work with. (safe_question stays the
+    # clean text used for logging/display — this is only for search.)
     if history:
         last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
         last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
@@ -453,155 +449,195 @@ def diagnose(
     else:
         search_query = safe_question
 
-    # --------------------------------------------------------
-    # STEP 3 — Search Pinecone
-    # --------------------------------------------------------
+    return {
+        "safe_question": safe_question,
+        "history": history,
+        "search_query": search_query,
+    }
+
+
+def node_retrieve(state: DiagnoseState) -> dict:
+    """STEP 5: search Pinecone and record the best score."""
 
     print("\nSearching Pinecone...")
-    matches = retrieve(search_query)
+    matches = retrieve(state["search_query"])
     print_matches(matches)
-
-    # --------------------------------------------------------
-    # STEP 4 — Check best Pinecone score
-    # --------------------------------------------------------
 
     best_score = matches[0]["score"] if matches else 0
 
     print(f"\nBest Pinecone score: {best_score:.4f}")
     print(f"Minimum RAG score: {MIN_RAG_SCORE}")
 
-    source = "rag"
+    return {"matches": matches, "best_score": best_score}
 
-    # --------------------------------------------------------
-    # STEP 5 — If Pinecone result is extremely weak, skip
-    #          straight to the MCP fallback.
-    # --------------------------------------------------------
 
-    if not matches or best_score < MIN_RAG_SCORE:
+def route_after_retrieve(state: DiagnoseState) -> str:
+    """STEP 6: if Pinecone's best result is extremely weak, skip
+    straight to the MCP fallback instead of bothering with a relevance
+    check."""
+
+    if not state["matches"] or state["best_score"] < MIN_RAG_SCORE:
         print("\nRAG retrieval is too weak.")
         print("-> Switching to MCP / Context7...")
+        return "too_weak"
 
-        mcp_result = asyncio.run(resolve_via_mcp(search_query))
+    print("\nRAG retrieved potentially relevant documentation.")
+    print("-> Checking whether the documentation can answer the question...")
+    return "check_relevance"
 
-        if mcp_result:
-            print("\nMCP returned documentation.")
-            print("-> Asking GPT to formulate the answer.")
-            print("\n--- RAW MCP RESULT (for debugging) ---")
-            print(mcp_result[:3000])
-            print("--- END RAW MCP RESULT ---\n")
 
-            content = [{
-                "type": "text",
-                "text": (
-                    "You are a helpful teaching assistant for an AI bootcamp.\n\n"
-                    "Use ONLY the documentation below to answer the student's "
-                    "question. Do NOT use your own training knowledge about "
-                    "this library, even if you think you remember how it "
-                    "works — libraries change, and your training data may "
-                    "be outdated. If the documentation below doesn't clearly "
-                    "answer the question, say so honestly instead of "
-                    "guessing from memory.\n\n"
-                    f"Documentation:\n{mcp_result}\n\n"
-                    f"Student question:\n{safe_question}"
-                ),
-            }]
+def node_check_relevance(state: DiagnoseState) -> dict:
+    """STEP 7: ask GPT whether the retrieved docs are actually useful."""
 
-            answer = ask_model(content, history=history)
-            answer = redact_secrets(answer)
-            escalated = False
-            source = "mcp_fallback"
+    rag_is_relevant = check_rag_relevance(state["search_query"], state["matches"])
 
-        else:
-            answer = (
-                "I couldn't find a confident answer in the available "
-                "documentation. A TA needs to take a look at this."
-            )
-            escalated = True
-            source = "escalated"
-
+    if rag_is_relevant:
+        print("\nRAG has enough information.")
+        print("-> Generating answer from internal documentation.")
     else:
-        # ----------------------------------------------------
-        # STEP 6 — Ask GPT if RAG context is actually useful
-        # ----------------------------------------------------
+        print("\nRAG does not have enough information.")
+        print("-> Switching to MCP / Context7...")
 
-        print("\nRAG retrieved potentially relevant documentation.")
-        print("-> Checking whether the documentation can answer the question...")
+    return {"rag_is_relevant": rag_is_relevant}
 
-        rag_is_relevant = check_rag_relevance(search_query, matches)
 
-        if rag_is_relevant:
-            print("\nRAG has enough information.")
-            print("-> Generating answer from internal documentation.")
+def route_after_relevance(state: DiagnoseState) -> str:
+    return "relevant" if state["rag_is_relevant"] else "not_relevant"
 
-            content = build_answer_prompt(safe_question, matches, image_path)
-            answer = ask_model(content, history=history)
-            answer = redact_secrets(answer)
-            escalated = False
-            source = "rag"
 
-        else:
-            print("\nRAG does not have enough information.")
-            print("-> Switching to MCP / Context7...")
+def node_answer_from_rag(state: DiagnoseState) -> dict:
+    content = build_answer_prompt(state["safe_question"], state["matches"], state.get("image_path"))
+    answer = ask_model(content, history=state.get("history"))
+    answer = redact_secrets(answer)
+    return {"answer": answer, "escalated": False, "source": "rag"}
 
-            mcp_result = asyncio.run(resolve_via_mcp(search_query))
 
-            if mcp_result:
-                print("\nMCP returned documentation.")
-                print("-> Asking GPT to formulate the answer.")
-                print("\n--- RAW MCP RESULT (for debugging) ---")
-                print(mcp_result[:3000])
-                print("--- END RAW MCP RESULT ---\n")
+def node_mcp_fallback(state: DiagnoseState) -> dict:
+    """STEP 8: call Context7 through MCP. Reached either directly from
+    a too-weak Pinecone result, or after RAG was found not relevant."""
 
-                content = [{
-                    "type": "text",
-                    "text": (
-                        "You are a helpful teaching assistant for an AI bootcamp.\n\n"
-                        "Use ONLY the documentation below to answer the student's "
-                        "question. Do NOT use your own training knowledge about "
-                        "this library, even if you think you remember how it "
-                        "works — libraries change, and your training data may "
-                        "be outdated. If the documentation below doesn't clearly "
-                        "answer the question, say so honestly instead of "
-                        "guessing from memory.\n\n"
-                        f"Documentation:\n{mcp_result}\n\n"
-                        f"Student question:\n{safe_question}"
-                    ),
-                }]
+    mcp_result = asyncio.run(resolve_via_mcp(state["search_query"]))
 
-                answer = ask_model(content, history=history)
-                answer = redact_secrets(answer)
-                escalated = False
-                source = "mcp_fallback"
+    if mcp_result:
+        print("\nMCP returned documentation.")
+        print("-> Asking GPT to formulate the answer.")
+        print("\n--- RAW MCP RESULT (for debugging) ---")
+        print(mcp_result[:3000])
+        print("--- END RAW MCP RESULT ---\n")
 
-            else:
-                answer = (
-                    "I couldn't find a confident answer in the available "
-                    "documentation. A TA needs to take a look at this."
-                )
-                escalated = True
-                source = "escalated"
+    return {"mcp_result": mcp_result}
 
-    # --------------------------------------------------------
-    # STEP 7 — Save this turn to thread memory
-    # --------------------------------------------------------
 
-    add_turn(thread_id, safe_question, answer)
+def route_after_mcp(state: DiagnoseState) -> str:
+    return "found" if state.get("mcp_result") else "not_found"
 
-    # --------------------------------------------------------
-    # STEP 8 — Log result
-    # --------------------------------------------------------
 
-    log_to_csv(safe_question, answer, escalated, source)
+def node_answer_from_mcp(state: DiagnoseState) -> dict:
+    content = [{
+        "type": "text",
+        "text": (
+            "You are a helpful teaching assistant for an AI bootcamp.\n\n"
+            "Use ONLY the documentation below to answer the student's "
+            "question. Do NOT use your own training knowledge about "
+            "this library, even if you think you remember how it "
+            "works — libraries change, and your training data may "
+            "be outdated. If the documentation below doesn't clearly "
+            "answer the question, say so honestly instead of "
+            "guessing from memory.\n\n"
+            f"Documentation:\n{state['mcp_result']}\n\n"
+            f"Student question:\n{state['safe_question']}"
+        ),
+    }]
 
-    # --------------------------------------------------------
-    # STEP 9 — Return result
-    # --------------------------------------------------------
+    answer = ask_model(content, history=state.get("history"))
+    answer = redact_secrets(answer)
+    return {"answer": answer, "escalated": False, "source": "mcp_fallback"}
+
+
+def node_escalate(state: DiagnoseState) -> dict:
+    answer = (
+        "I couldn't find a confident answer in the available "
+        "documentation. A TA needs to take a look at this."
+    )
+    return {"answer": answer, "escalated": True, "source": "escalated"}
+
+
+def node_finalize(state: DiagnoseState) -> dict:
+    """STEP 9-10: save this turn to thread memory and log the result."""
+
+    add_turn(state.get("thread_id"), state["safe_question"], state["answer"])
+    log_to_csv(state["safe_question"], state["answer"], state["escalated"], state["source"])
+    return {}
+
+
+def _build_graph():
+    graph = StateGraph(DiagnoseState)
+
+    graph.add_node("redact_and_prepare", node_redact_and_prepare)
+    graph.add_node("retrieve", node_retrieve)
+    graph.add_node("check_relevance", node_check_relevance)
+    graph.add_node("answer_from_rag", node_answer_from_rag)
+    graph.add_node("mcp_fallback", node_mcp_fallback)
+    graph.add_node("answer_from_mcp", node_answer_from_mcp)
+    graph.add_node("escalate", node_escalate)
+    graph.add_node("finalize", node_finalize)
+
+    graph.add_edge(START, "redact_and_prepare")
+    graph.add_edge("redact_and_prepare", "retrieve")
+
+    graph.add_conditional_edges("retrieve", route_after_retrieve, {
+        "too_weak": "mcp_fallback",
+        "check_relevance": "check_relevance",
+    })
+    graph.add_conditional_edges("check_relevance", route_after_relevance, {
+        "relevant": "answer_from_rag",
+        "not_relevant": "mcp_fallback",
+    })
+    graph.add_conditional_edges("mcp_fallback", route_after_mcp, {
+        "found": "answer_from_mcp",
+        "not_found": "escalate",
+    })
+
+    graph.add_edge("answer_from_rag", "finalize")
+    graph.add_edge("answer_from_mcp", "finalize")
+    graph.add_edge("escalate", "finalize")
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+_compiled_graph = _build_graph()
+
+
+# ============================================================
+# MAIN DIAGNOSIS PIPELINE
+# ============================================================
+
+def diagnose(
+    question: str,
+    image_path: str | None = None,
+    thread_id: str | None = None,
+) -> dict:
+    """
+    Main support pipeline, run as a compiled LangGraph state machine
+    (see the node functions and _build_graph() above).
+
+    `thread_id` should be the Slack thread's root timestamp (thread_ts,
+    or the message's own ts if it's the first message in the thread).
+    Pass None (e.g. from the CLI test) to skip memory entirely.
+    """
+
+    final_state = _compiled_graph.invoke({
+        "question": question,
+        "image_path": image_path,
+        "thread_id": thread_id,
+    })
 
     return {
-        "answer": answer,
-        "escalated": escalated,
-        "best_score": best_score,
-        "source": source
+        "answer": final_state["answer"],
+        "escalated": final_state["escalated"],
+        "best_score": final_state["best_score"],
+        "source": final_state["source"],
     }
 
 

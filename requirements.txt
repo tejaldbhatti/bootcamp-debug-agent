@@ -5,3 +5,4 @@ flask>=3.0.0
 slack_sdk>=3.27.0
 mcp>=1.9.0
 gunicorn>=22.0.0
+langgraph>=0.2.0
