@@ -156,8 +156,33 @@ Google Sheets log during local testing.
 ## Deployment
 
 Not yet deployed — currently running locally and exposed via ngrok
-while testing. Planned: deploy `api.py` to Render so n8n has a stable
-URL instead of one that changes every time ngrok restarts.
+while testing. Planned: deploy `src/api.py` to Render so n8n has a
+stable URL instead of one that changes every time ngrok restarts.
+
+Notes for when that happens:
+
+- **Start command**: set Render's "Root Directory" to `src`, then use
+  `gunicorn -b 0.0.0.0:$PORT api:app` as the start command (Render
+  injects `$PORT`; Flask's built-in dev server isn't meant for
+  production use). Root Directory has to be `src` specifically —
+  `api.py` imports `query`/`memory` as flat sibling modules, so `src/`
+  itself needs to be the working directory for those imports to
+  resolve, the same way `python src/api.py` works locally.
+- **Env vars**: set `OPENAI_API_KEY`, `PINECONE_API_KEY`,
+  `SLACK_BOT_TOKEN`, `SLACK_SUPPORT_CHANNEL_ID`, and `API_SHARED_SECRET`
+  directly in Render's dashboard — never from a committed file.
+- **`API_SHARED_SECRET`**: set this once deployed (see `.env.example`)
+  and add a matching `X-API-Key` header in n8n's "Call Diagnose API"
+  node. Without it, `/diagnose` is open to anyone who finds the URL.
+- **`thread_memory.json` is not persistent on Render.** The default
+  web service filesystem is ephemeral — it resets on every redeploy,
+  and wouldn't be shared across instances if this ever scales past
+  one. In-thread follow-up context would reset when that happens. For
+  a support bot this is a reasonable tradeoff (context lost is a mild
+  inconvenience, not data loss), but it's worth knowing rather than
+  discovering by surprise. If long-term persistence matters later, a
+  Render persistent disk or a small hosted store (Redis, SQLite on a
+  disk) would replace the local JSON file.
 
 ## Status
 
@@ -167,4 +192,7 @@ URL instead of one that changes every time ngrok restarts.
   Message" timestamp expression was missing its `||` fallback
   operator, causing every reply to post unthreaded; a bot-message
   filter was also added right after the Slack Trigger node
-- Render deployment — not yet done (see Deployment above)
+- Render deployment — repo is prepped (gunicorn added, `/diagnose`
+  supports optional shared-secret auth) but not yet deployed; the
+  Render service itself still needs to be created (see Deployment
+  above)

@@ -8,9 +8,16 @@ Run:
 Then POST to http://localhost:5000/diagnose with JSON:
     {"question": "my error text", "image_base64": "optional, base64 png",
      "thread_id": "optional, Slack thread_ts for memory"}
+
+If API_SHARED_SECRET is set in the environment, requests must also
+include a matching `X-API-Key` header (checked in n8n's HTTP Request
+node under Headers). Left unset, the endpoint is open — fine for local
+dev, but set it once this is deployed somewhere public so random
+requests can't run up your OpenAI/Pinecone bill.
 """
 
 import base64
+import hmac
 import tempfile
 import os
 from flask import Flask, request, jsonify
@@ -18,9 +25,16 @@ from query import diagnose
 
 app = Flask(__name__)
 
+API_SHARED_SECRET = os.environ.get("API_SHARED_SECRET")
+
 
 @app.route("/diagnose", methods=["POST"])
 def diagnose_endpoint():
+    if API_SHARED_SECRET and not hmac.compare_digest(
+        request.headers.get("X-API-Key", ""), API_SHARED_SECRET
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+
     data = request.get_json(force=True)
     question = data.get("question", "")
     thread_id = data.get("thread_id")
