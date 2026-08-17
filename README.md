@@ -1,26 +1,48 @@
 # Bootcamp Debug Agent
 
 An AI support agent for a bootcamp's Slack channel. Students post
-errors; it answers from an internal RAG knowledge base, falls back to
-live library docs via MCP when RAG isn't confident, keeps context
-across threaded follow-ups, and escalates to a human when neither
-source has a solid answer. Deployed and running in production.
+errors — text or a screenshot — and it answers from an internal RAG
+knowledge base, falls back to live library docs via MCP when RAG
+isn't confident, keeps context across threaded follow-ups, and
+escalates to a human when neither source has a solid answer.
+Deployed and running in production.
 
 **Highlights**
 - Diagnosis logic modeled as an explicit **LangGraph** state machine (8 nodes, conditional routing) rather than nested if/else
-- **RAG** (Pinecone + OpenAI embeddings) with a GPT relevance check before trusting a retrieval, not just a similarity score
+- **RAG** (Pinecone + OpenAI embeddings) with a GPT relevance check before trusting a retrieval — not just a similarity score
 - **Live doc fallback** via MCP (Context7), with a multi-round tool-calling loop for chained lookups
-- **Thread-aware**: Slack follow-ups keep conversation context; vague follow-ups get context-aware search
-- **Per-request cost tracking**: OpenAI $ cost estimated from actual token usage, logged per turn
-- **Vision**: screenshots described via GPT-4o before retrieval, so image-only reports still search well
+- **Thread-aware**: Slack follow-ups keep conversation context, so a vague reply like "still not working" still searches with the right context
+- **Vision**: screenshots are described via GPT-4o before retrieval, so image-only reports still search well
+- **Per-request cost tracking**: OpenAI cost estimated from actual token usage and logged per turn
 - Deployed on **Render**, orchestrated by **n8n** (Slack trigger → API → threaded reply + Google Sheets log), with shared-secret auth on the API
 
 ## Contents
-1. [Architecture](#architecture)
-2. [Stack](#stack)
-3. [Project layout](#project-layout)
-4. [Deployment](#deployment)
-5. [Status](#status)
+1. [Demo](#demo)
+2. [Architecture](#architecture)
+3. [Stack](#stack)
+4. [Project layout](#project-layout)
+5. [Deployment](#deployment)
+6. [Status](#status)
+
+## Demo
+
+**Screenshot-only input, answered from the internal knowledge base:**
+No typed error message at all — just a screenshot and "i am having an
+issue with Airtable." The agent reads the image, matches it to
+internal docs, and walks through the fix.
+
+![Screenshot-only question, answered from internal docs](screenshots/airtable-kb-answer.png)
+
+**A question the internal docs don't cover, answered via live MCP fallback:**
+Library APIs change too fast to hardcode, so when the internal docs
+come up empty, the agent looks up current documentation live instead
+of guessing.
+
+![Question answered via live MCP doc lookup](screenshots/openai-sdk-mcp-answer.png)
+
+**The decision flow behind both answers:**
+
+![Flowchart of the diagnosis pipeline](screenshots/flow-diagram.png)
 
 ## Architecture
 
