@@ -19,9 +19,8 @@ source has a solid answer. Deployed and running in production.
 1. [Architecture](#architecture)
 2. [Stack](#stack)
 3. [Project layout](#project-layout)
-4. [Local development](#local-development)
-5. [Deployment](#deployment)
-6. [Status](#status)
+4. [Deployment](#deployment)
+5. [Status](#status)
 
 ## Architecture
 
@@ -73,26 +72,8 @@ bootcamp-debug-agent/
     └── slack_export.py     # optional: pull real Q&A from Slack history
 ```
 
-## Local development
-
-```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env            # fill in real API keys, never commit .env
-```
-
-Add your own notes under `docs/` (not included in the repo — see
-below), then:
-
-```bash
-python src/ingest.py            # docs/ -> Pinecone
-python src/query.py             # CLI test, no Slack/n8n needed
-python src/api.py               # run the API locally on :5000
-```
-
-`docs/` is intentionally not committed — it's the bootcamp's own
-curriculum content, and the deployed app queries Pinecone directly at
-runtime, never these files. Only `ingest.py` reads them.
+`docs/` (the knowledge base source) isn't committed — it's the
+bootcamp's own curriculum content, kept private.
 
 ## Deployment
 
